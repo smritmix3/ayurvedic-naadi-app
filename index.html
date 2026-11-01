@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Contact-PPG Naadi & Pulse Indicator</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0b1329; color: #f8fafc; text-align: center; padding: 16px; }
+        .card { background: #1e293b; border-radius: 20px; padding: 20px; max-width: 440px; margin: auto; box-shadow: 0 15px 35px rgba(0,0,0,0.6); border: 1px solid #334155; }
+        h1 { font-size: 1.4rem; color: #38bdf8; margin-bottom: 4px; }
+        p { font-size: 0.85rem; color: #94a3b8; margin-bottom: 16px; line-height: 1.4; }
+        
+        /* Camera Preview Box to verify finger seal */
+        .preview-container { width: 120px; height: 90px; margin: 12px auto; background: #000; border-radius: 8px; overflow: hidden; border: 2px solid #38bdf8; }
+        #videoElement { width: 100%; height: 100%; object-fit: cover; }
+        
+        .pulse-box { background: #0f172a; border-radius: 14px; padding: 16px; margin: 16px 0; border: 1px solid #334155; }
+        .bpm-display { font-size: 3rem; font-weight: bold; color: #f43f5e; margin-bottom: 2px; }
+        .dosha-tag { display: inline-block; padding: 6px 14px; border-radius: 20px; font-weight: 600; font-size: 0.85rem; margin-top: 8px; background: #334155; color: #cbd5e1; }
+        
+        canvas { width: 100%; height: 90px; background: #020617; border-radius: 8px; margin-top: 10px; }
+        button { background: #0284c7; color: #fff; border: none; padding: 14px 28px; font-size: 1rem; font-weight: 600; border-radius: 10px; width: 100%; cursor: pointer; transition: background 0.2s; }
+        button:hover { background: #0369a1; }
+        button:disabled { background: #475569; cursor: not-allowed; }
+        
+        #statusMsg { font-size: 0.8rem; color: #38bdf8; margin-top: 12px; min-height: 20px; }
+    </style>
+</head>
+<body>
+
+    <div class="card">
+        <h1>Contact Naadi Scanner</h1>
+        <p>Cover the <strong>main rear camera lens</strong> and flash completely with your index finger.</p>
+
+        <button id="startBtn">Start Contact Scan</button>
+
+        <div class="preview-container">
+            <video id="videoElement" playsinline muted></video>
+        </div>
+
+        <div class="pulse-box">
+            <div id="bpm" class="bpm-display">-- <span style="font-size: 1rem; color: #94a3b8;">BPM</span></div>
+            <div id="dosha" class="dosha-tag">State: Awaiting Finger</div>
+            <canvas id="waveformCanvas"></canvas>
+        </div>
+        
+        <p id="statusMsg">Ready to initialize camera sensor...</p>
+    </div>
+
+    <canvas id="processCanvas" style="display:none;"></canvas>
+
+    <script>
+        const startBtn = document.getElementById('startBtn');
+        const video = document.getElementById('videoElement');
+        const processCanvas = document.getElementById('processCanvas');
+        const processCtx = processCanvas.getContext('2d', { willReadFrequently: true });
+        
+        const waveCanvas = document.getElementById('waveformCanvas');
+        const waveCtx = waveCanvas.getContext('2d');
+        const bpmEl = document.getElementById('bpm');
+        const doshaEl = document.getElementById('dosha');
+        const statusMsg = document.getElementById('statusMsg');
+
+        let stream = null;
+        let rawBuffer = [];
+        let filteredBuffer = [];
+        const FPS = 30;
+        const BUFFER_SIZE = FPS * 10; // 10-second rolling window
+        let isRunning = false;
+
+        // Mathematical Detrending Variables (EMA)
+        let emaState = 0;
+        const alpha = 0.05;
+
+        startBtn.addEventListener('click', async () => {
+            if (isRunning) return;
+            try {
+                statusMsg.innerText = "Accessing rear camera...";
+                
+                // Open rear camera stream
+                stream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        facingMode: { exact: "environment" },
+                        width: { ideal: 640 },
+                        height: { ideal: 480 },
+                        frameRate: { ideal: FPS }
+                    }
+                });
+
+                video.srcObject = stream;
+                await video.play();
+
+                // Safely turn on the flashlight (torch)
+                const track = stream.getVideoTracks()[0];
+                try {
+                    await track.applyConstraints({ advanced: [{ torch: true }] });
+                    statusMsg.innerText = "Flash active. Place finger firmly over lens.";
+                } catch (err) {
+                    console.warn("Torch constraint failed:", err);
+                    statusMsg.innerText = "Turn on flash manually, then cover lens.";
+                }
+
+                processCanvas.width = video.videoWidth || 640;
+                processCanvas.height = video.videoHeight || 480;
+                waveCanvas.width = waveCanvas.offsetWidth;
+                waveCanvas.height = waveCanvas.offsetHeight;
+
+                isRunning = true;
+                startBtn.disabled = true;
+                
+                requestAnimationFrame(processFrame);
+
+            } catch (err) {
+                console.error("Camera setup error:", err);
+                statusMsg.innerText = "Error: Use HTTPS / ngrok and grant camera permissions.";
+            }
+        });
+
+        function processFrame() {
+            if (!isRunning) return;
+
+            processCtx.drawImage(video, 0, 0, processCanvas.width, processCanvas.height);
+            
+            // Extract center Region of Interest (ROI) where finger covers lens
+            const roiSize = 50;
+            const startX = (processCanvas.width / 2) - (roiSize / 2);
+            const startY = (processCanvas.height / 2) - (roiSize / 2);
+            const imgData = processCtx.getImageData(startX, startY, roiSize, roiSize);
+            const pixels = imgData.data;
+
+            let greenSum = 0;
+            const totalPixels = pixels.length / 4;
+
+            for (let i = 0; i < pixels.length; i += 4) {
+                greenSum += pixels[i+1]; // Green channel carries deepest blood volume absorption data
+            }
+
+            const avgGreen = greenSum / totalPixels;
+
+            // Quality Gate: Check if finger is actually covering the lens (too bright = uncovered, too dark = blocked)
+            if (avgGreen < 20 || avgGreen > 245) {
+                statusMsg.innerText = "Adjust finger: Ensure lens & flash are fully sealed.";
+                requestAnimationFrame(processFrame);
+                return;
+            }
+
+            // 1. Exponential Moving Average Detrending (Removes baseline shifting/breathing drift)
+            if (rawBuffer.length === 0) emaState = avgGreen;
+            else emaState = (alpha * avgGreen) + ((1 - alpha) * emaState);
+            
+            const detrended = avgGreen - emaState;
+
+            rawBuffer.push(detrended);
+            if (rawBuffer.length > BUFFER_SIZE) rawBuffer.shift();
+
+            // 2. Smoothing Filter to eliminate high-frequency digital noise
+            filteredBuffer = applySmoothingFilter(rawBuffer);
+
+            drawWaveform(filteredBuffer);
+
+            // 3. Analyze signal once 5+ seconds of clean data are collected
+            if (filteredBuffer.length >= FPS * 5) {
+                analyzeNaadiSignal(filteredBuffer);
+            }
+
+            requestAnimationFrame(processFrame);
+        }
+
+        function applySmoothingFilter(buffer) {
+            const windowSize = 5;
+            let output = [];
+            for (let i = 0; i < buffer.length; i++) {
+                let sum = 0;
+                let count = 0;
+                for (let j = -Math.floor(windowSize/2); j <= Math.floor(windowSize/2); j++) {
+                    if (i + j >= 0 && i + j < buffer.length) {
+                        sum += buffer[i + j];
+                        count++;
+                    }
+                }
+                output.push(sum / count);
+            }
+            return output;
+        }
+
+        function drawWaveform(buffer) {
+            waveCtx.clearRect(0, 0, waveCanvas.width, waveCanvas.height);
+            if (buffer.length < 2) return;
+
+            const min = Math.min(...buffer);
+            const max = Math.max(...buffer);
+            const range = (max - min) || 0.001;
+
+            waveCtx.beginPath();
+            waveCtx.strokeStyle = '#38bdf8';
+            waveCtx.lineWidth = 2;
+
+            const step = waveCanvas.width / BUFFER_SIZE;
+            for (let i = 0; i < buffer.length; i++) {
+                const norm = (buffer[i] - min) / range;
+                const y = waveCanvas.height - (norm * (waveCanvas.height - 16) + 8);
+                const x = i * step;
+
+                if (i === 0) waveCtx.moveTo(x, y);
+                else waveCtx.lineTo(x, y);
+            }
+            waveCtx.stroke();
+        }
+
+        function analyzeNaadiSignal(buffer) {
+            // Mathematical peak detection with dynamic thresholding and refractory window
+            const mean = buffer.reduce((a, b) => a + b, 0) / buffer.length;
+            const variance = buffer.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / buffer.length;
+            const stdDev = Math.sqrt(variance);
+            
+            const peakThreshold = mean + (0.4 * stdDev);
+            const minRefractoryFrames = Math.floor(FPS * 0.35); // 350ms refractory period (~170 BPM max ceiling)
+
+            let peakIndices = [];
+            for (let i = 1; i < buffer.length - 1; i++) {
+                if (buffer[i] > buffer[i - 1] && buffer[i] > buffer[i + 1]) {
+                    if (buffer[i] > peakThreshold) {
+                        if (peakIndices.length === 0 || (i - peakIndices[peakIndices.length - 1]) >= minRefractoryFrames) {
+                            peakIndices.push(i);
+                        }
+                    }
+                }
+            }
+
+            if (peakIndices.length >= 2) {
+                let intervalsSum = 0;
+                for (let i = 1; i < peakIndices.length; i++) {
+                    intervalsSum += (peakIndices[i] - peakIndices[i - 1]);
+                }
+                const avgIBISeconds = (intervalsSum / (peakIndices.length - 1)) / FPS;
+                const estimatedBPM = Math.round(60 / avgIBISeconds);
+
+                if (estimatedBPM >= 45 && estimatedBPM <= 160) {
+                    bpmEl.innerHTML = `${estimatedBPM} <span style="font-size: 1rem; color: #94a3b8;">BPM</span>`;
+                    
+                    // Map Vega to Dosha proxies
+                    if (estimatedBPM > 88) {
+                        doshaEl.innerText = "Vega: Fast (Vata Dominant Proxy)";
+                        doshaEl.style.color = "#f59e0b";
+                    } else if (estimatedBPM >= 72 && estimatedBPM <= 88) {
+                        doshaEl.innerText = "Vega: Moderate (Pitta Dominant Proxy)";
+                        doshaEl.style.color = "#ef4444";
+                    } else {
+                        doshaEl.innerText = "Vega: Slow (Kapha Dominant Proxy)";
+                        doshaEl.style.color = "#10b981";
+                    }
+                    statusMsg.innerText = "Signal locked. Hold finger steady.";
+                }
+            } else {
+                statusMsg.innerText = "Acquiring pulse waveform... Hold finger still.";
+            }
+        }
+    </script>
+</body>
+</html>
